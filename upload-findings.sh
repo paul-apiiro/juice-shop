@@ -1,18 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NOTE: the exact request shape for uploading external findings is defined at
-# https://docs.apiiro.com/api (auth-gated, not verified in this session).
-# Confirm the path/payload against that reference before relying on this in CI.
+usage() {
+  echo "usage: upload-findings.sh <head-sha> <head-trivy.json> <head-gitleaks.json> [<base-sha> <base-trivy.json> <base-gitleaks.json>]" >&2
+  exit 1
+}
 
-TRIVY_FILE="${1:?usage: upload-findings.sh <trivy.json> <gitleaks.json> <commit-sha>}"
-GITLEAKS_FILE="${2:?usage: upload-findings.sh <trivy.json> <gitleaks.json> <commit-sha>}"
-COMMIT_SHA="${3:?usage: upload-findings.sh <trivy.json> <gitleaks.json> <commit-sha>}"
+[ $# -eq 3 ] || [ $# -eq 6 ] || usage
 
-payload=$(jq -n \
-  --arg sha "$COMMIT_SHA" \
-  --slurpfile trivy "$TRIVY_FILE" \
-  --slurpfile gitleaks "$GITLEAKS_FILE" \
-  '{commitSha: $sha, trivy: $trivy[0], gitleaks: $gitleaks[0]}')
+HEAD_SHA="$1"; HEAD_TRIVY="$2"; HEAD_GITLEAKS="$3"
+BASE_SHA="${4:-}"; BASE_TRIVY="${5:-}"; BASE_GITLEAKS="${6:-}"
 
-echo "$payload" | apiiro api "/rest-api/v1/diffScans/findings" -X POST -d @-
+# Tags each finding with the commit it came from, so Apiiro can tell new
+# findings (on the candidate commit) from pre-existing ones (on the baseline).
+extract_trivy() {
+  jq -c --arg sha "$2" '
+    (.Results // [])[] as $r
+    | (($r.Vulnerabilities // [])[] | {source: "trivy-vuln", commitSha: $sha} + .),
+      (($r.Secrets // [])[] | {source: "trivy-secret", commitSha: $sha} + .)
+  ' "$1" 2>/dev/null
+}
+
+extract_gitleaks() {
+  jq -c --arg sha "$2" '(. // [])[] | {source: "gitleaks", commitSha: $sha} + .' "$1" 2>/dev/null
+}
+
+findings=$(
+  {
+    extract_trivy "$HEAD_TRIVY" "$HEAD_SHA"
+    extract_gitleaks "$HEAD_GITLEAKS" "$HEAD_SHA"
+    if [ -n "$BASE_SHA" ]; then
+      extract_trivy "$BASE_TRIVY" "$BASE_SHA"
+      extract_gitleaks "$BASE_GITLEAKS" "$BASE_SHA"
+    fi
+  } | jq -s '.'
+)
+
+echo "$findings" | apiiro api /rest-api/v1/uploadFindings -X POST -d @-

@@ -29,21 +29,37 @@ jobs:
       - name: Trigger Apiiro diff scan (don't block)
         id: scan
         run: |
-          SCAN_ID=$(apiiro diff-scan \
+          set -uo pipefail
+          SCAN_OUTPUT=$(apiiro diff-scan \
             -b "${{ github.event.pull_request.base.sha }}" \
             -c "${{ github.event.pull_request.head.sha }}" \
             -r "https://github.com/${{ github.repository }}" \
             --baseline-type Commit --candidate-type Commit \
-            --wait-external --no-wait -o json | jq -r .scanId)
+            --wait-external --no-wait -o json) || true
+          SCAN_ID=$(echo "$SCAN_OUTPUT" | jq -r '.scanId // empty')
+          if [ -z "$SCAN_ID" ]; then
+            echo "::error::Failed to trigger diff scan: $SCAN_OUTPUT"
+            exit 1
+          fi
           echo "id=$SCAN_ID" >> "$GITHUB_OUTPUT"
 
-      - name: Run external scanners
+      - name: Run external scanners (head)
         run: |
-          trivy fs --format json -o trivy.json .
-          gitleaks detect --report-format json --report-path gitleaks.json --no-git || true
+          trivy fs --format json -o trivy-head.json .
+          gitleaks detect --report-format json --report-path gitleaks-head.json --no-git || true
+
+      - name: Run external scanners (base)
+        run: |
+          git worktree add /tmp/base-scan "${{ github.event.pull_request.base.sha }}"
+          trivy fs --format json -o /tmp/trivy-base.json /tmp/base-scan
+          gitleaks detect --source /tmp/base-scan --report-format json --report-path /tmp/gitleaks-base.json --no-git || true
+          git worktree remove /tmp/base-scan --force
 
       - name: Upload results to Apiiro
-        run: ./upload-findings.sh trivy.json gitleaks.json "${{ github.event.pull_request.head.sha }}"
+        run: |
+          ./upload-findings.sh \
+            "${{ github.event.pull_request.head.sha }}" trivy-head.json gitleaks-head.json \
+            "${{ github.event.pull_request.base.sha }}" /tmp/trivy-base.json /tmp/gitleaks-base.json
 
       - name: Signal uploads complete   # without this the scan waits an hour
         run: apiiro api "/rest-api/v1/diffScans/${{ steps.scan.outputs.id }}/finishUploadingFindings" -X PUT
