@@ -55,11 +55,22 @@ jobs:
           gitleaks detect --source /tmp/base-scan --report-format json --report-path /tmp/gitleaks-base.json --no-git || true
           git worktree remove /tmp/base-scan --force
 
+      - name: Resolve Apiiro repository key
+        id: repo
+        run: |
+          KEY=$(apiiro guardian repository detect -o json | jq -r '.data.key')
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
       - name: Upload results to Apiiro
+        env:
+          REPOSITORY_KEY: ${{ steps.repo.outputs.key }}
+          REPOSITORY_CLONE_URL: https://github.com/${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SCAN_PROJECT_NAME: ${{ github.repository }}-security-gate
         run: |
           ./upload-findings.sh \
-            "${{ github.event.pull_request.head.sha }}" trivy-head.json gitleaks-head.json \
-            "${{ github.event.pull_request.base.sha }}" /tmp/trivy-base.json /tmp/gitleaks-base.json
+            "${{ github.event.pull_request.head.sha }}" "${{ github.head_ref }}" trivy-head.json gitleaks-head.json \
+            "${{ github.event.pull_request.base.sha }}" "${{ github.base_ref }}" /tmp/trivy-base.json /tmp/gitleaks-base.json
 
       - name: Signal uploads complete   # without this the scan waits an hour
         run: apiiro api "/rest-api/v1/diffScans/${{ steps.scan.outputs.id }}/finishUploadingFindings" -X PUT
