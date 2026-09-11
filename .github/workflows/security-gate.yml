@@ -5,7 +5,7 @@ jobs:
   gate:
     runs-on: ubuntu-latest
     env:
-      APIIRO_API_URL: https://app.apiiro.com
+      APIIRO_API_URL: https://app-staging.apiiro.com
       APIIRO_API_KEY: ${{ secrets.APIIRO_API_KEY }}
     steps:
       - uses: actions/checkout@v4
