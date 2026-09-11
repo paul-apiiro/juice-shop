@@ -1,0 +1,60 @@
+name: Security gate
+on: pull_request
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      APIIRO_API_URL: https://app.apiiro.com
+      APIIRO_API_KEY: ${{ secrets.APIIRO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Install Apiiro CLI
+        run: |
+          curl -fsSL https://github.com/apiiro/marketplace/releases/latest/download/apiiro-linux-x64 -o /usr/local/bin/apiiro
+          chmod +x /usr/local/bin/apiiro
+          apiiro --version
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION=8.18.4
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Trigger Apiiro diff scan (don't block)
+        id: scan
+        run: |
+          SCAN_ID=$(apiiro diff-scan \
+            -b "${{ github.event.pull_request.base.sha }}" \
+            -c "${{ github.event.pull_request.head.sha }}" \
+            -r "https://github.com/${{ github.repository }}" \
+            --baseline-type Commit --candidate-type Commit \
+            --wait-external --no-wait -o json | jq -r .scanId)
+          echo "id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run external scanners
+        run: |
+          trivy fs --format json -o trivy.json .
+          gitleaks detect --report-format json --report-path gitleaks.json --no-git || true
+
+      - name: Upload results to Apiiro
+        run: ./upload-findings.sh trivy.json gitleaks.json "${{ github.event.pull_request.head.sha }}"
+
+      - name: Signal uploads complete   # without this the scan waits an hour
+        run: apiiro api "/rest-api/v1/diffScans/${{ steps.scan.outputs.id }}/finishUploadingFindings" -X PUT
+
+      - name: Get verdict and gate
+        run: |
+          for i in $(seq 1 20); do
+            apiiro diff-scan -s "${{ steps.scan.outputs.id }}" -o json -f result.json
+            code=$?
+            [ "$code" -ne 2 ] && break
+            sleep 30
+          done
+          jq -r '.status' result.json
+          [ "$(jq -r .status result.json)" != "Block" ]
