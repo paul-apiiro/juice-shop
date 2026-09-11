@@ -1,0 +1,88 @@
+name: Security gate
+on: pull_request
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    env:
+      APIIRO_API_URL: https://app-staging.apiiro.com
+      APIIRO_API_KEY: ${{ secrets.APIIRO_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - name: Install Apiiro CLI
+        run: |
+          curl -fsSL https://github.com/apiiro/marketplace/releases/latest/download/apiiro-linux-x64 -o /usr/local/bin/apiiro
+          chmod +x /usr/local/bin/apiiro
+          apiiro --version
+
+      - name: Install Trivy
+        run: curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Install Gitleaks
+        run: |
+          GITLEAKS_VERSION=8.18.4
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+
+      - name: Trigger Apiiro diff scan (don't block)
+        id: scan
+        run: |
+          set -uo pipefail
+          SCAN_OUTPUT=$(apiiro diff-scan \
+            -b "${{ github.event.pull_request.base.sha }}" \
+            -c "${{ github.event.pull_request.head.sha }}" \
+            -r "https://github.com/${{ github.repository }}" \
+            --baseline-type Commit --candidate-type Commit \
+            --wait-external --no-wait -o json) || true
+          SCAN_ID=$(echo "$SCAN_OUTPUT" | jq -r '.scanId // empty')
+          if [ -z "$SCAN_ID" ]; then
+            echo "::error::Failed to trigger diff scan: $SCAN_OUTPUT"
+            exit 1
+          fi
+          echo "id=$SCAN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run external scanners (head)
+        run: |
+          trivy fs --format json -o trivy-head.json .
+          gitleaks detect --report-format json --report-path gitleaks-head.json --no-git || true
+
+      - name: Run external scanners (base)
+        run: |
+          git worktree add /tmp/base-scan "${{ github.event.pull_request.base.sha }}"
+          trivy fs --format json -o /tmp/trivy-base.json /tmp/base-scan
+          gitleaks detect --source /tmp/base-scan --report-format json --report-path /tmp/gitleaks-base.json --no-git || true
+          git worktree remove /tmp/base-scan --force
+
+      - name: Resolve Apiiro repository key
+        id: repo
+        run: |
+          KEY=$(apiiro guardian repository detect -o json | jq -r '.data.key')
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Upload results to Apiiro
+        env:
+          REPOSITORY_KEY: ${{ steps.repo.outputs.key }}
+          REPOSITORY_CLONE_URL: https://github.com/${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SCAN_PROJECT_NAME: ${{ github.repository }}-security-gate
+        run: |
+          ./upload-findings.sh \
+            "${{ github.event.pull_request.head.sha }}" "${{ github.head_ref }}" trivy-head.json gitleaks-head.json \
+            "${{ github.event.pull_request.base.sha }}" "${{ github.base_ref }}" /tmp/trivy-base.json /tmp/gitleaks-base.json
+
+      - name: Signal uploads complete   # without this the scan waits an hour
+        run: apiiro api "/rest-api/v1/diffScans/${{ steps.scan.outputs.id }}/finishUploadingFindings" -X PUT
+
+      - name: Get verdict and gate
+        run: |
+          set +e
+          for i in $(seq 1 20); do
+            apiiro diff-scan -s "${{ steps.scan.outputs.id }}" -o json -f result.json
+            code=$?
+            [ "$code" -ne 2 ] && break
+            sleep 30
+          done
+          jq -r '.status' result.json
+          [ "$(jq -r .status result.json)" != "Block" ]
